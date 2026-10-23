@@ -24,6 +24,7 @@ KORVON.SHOP — Telegram-бот (BotHost.ru).
   CARD_NUMBER, CARD_BANK, PAY_PHONE   (необязательно, есть значения по умолчанию)
   SITE_URL                    адрес сайта/приложения (https://...) для кнопки «Смотреть на сайте» в рассылке о новых товарах
                               (необязательно: если не задан, берётся settings/main.siteUrl — его сохраняет приложение, когда его открывает админ)
+  Обязательные подписки (каналы/группы/боты) админ настраивает в самом боте: команда /subs. CHANNEL_USERNAME — только стартовое значение списка.
   PROMO_GAP_MIN (20), PROMO_DAILY_MAX (5)   пауза между рассылками о товарах и максимум рассылок в день (необязательно)
 """
 import base64, calendar, hashlib, hmac, html, json, logging, os, random, re, threading, time, traceback, urllib.parse
@@ -324,6 +325,8 @@ def on_callback(cb):
     allowed = (set(admin_ids()) | set(kyc_admins())) if act in kyc_acts else set(admin_ids())
     if uid not in allowed:
         return tg("answerCallbackQuery", callback_query_id=cb["id"], text="Только для администратора", show_alert=True)
+    if act in ("sm", "sa", "sd", "sdy", "sx", "sk"):
+        return subs_callback(cb, act, oid)
     if act == "kok":
         return kyc_decide(cb, True, oid)
     if act == "kno":
@@ -1123,39 +1126,238 @@ def scheduler():
 
 
 # ---------- подписка на канал: проверка и напоминания каждые 4 часа ----------
-def subscribe_markup():
-    return {"inline_keyboard": [[{"text": "📢 Подписаться", "url": CHANNEL_URL}], [{"text": "✅ Я подписался", "callback_data": "subchk"}]]}
+# --- обязательные подписки: каналы / группы / боты. Список хранится в Firestore settings/botSubs,
+# --- админ управляет им прямо в боте командой /subs (добавить / удалить).
+SUB_ICON = {"channel": "📢", "group": "👥", "bot": "🤖"}
+SUB_SESS = {}            # chat_id админа -> {"step": "ref" | "invite_id", "pending": {...}}
+_subs_cache = {"t": 0, "v": None}
 
 
-def channel_subscribed(user_id):
-    """True/False — подписан ли пользователь на канал; None — проверить не удалось (бот не админ канала и т.п.)."""
-    r = tg("getChatMember", chat_id="@" + CHANNEL, user_id=user_id)
+def default_subs():
+    return [{"id": "main", "kind": "channel", "chat": "@" + CHANNEL, "title": "@" + CHANNEL, "url": CHANNEL_URL, "check": True}]
+
+
+def get_subs(force=False):
+    if not force and _subs_cache["v"] is not None and time.time() - _subs_cache["t"] < 60:
+        return _subs_cache["v"]
+    try:
+        d = db.collection("settings").document("botSubs").get()
+        v = (d.to_dict() or {}).get("items") if d.exists else None
+        if v is None:
+            v = default_subs()
+    except Exception:
+        log.exception("get_subs")
+        return _subs_cache["v"] if _subs_cache["v"] is not None else default_subs()
+    _subs_cache.update(t=time.time(), v=v)
+    return v
+
+
+def save_subs(items):
+    db.collection("settings").document("botSubs").set({"items": items, "updatedAt": int(time.time() * 1000)})
+    _subs_cache.update(t=time.time(), v=items)
+
+
+def sub_btn_text(s):
+    return "%s %s%s" % (SUB_ICON.get(s.get("kind"), "📢"), "Запустить " if s.get("kind") == "bot" else "Подписаться: ", s.get("title", ""))[:60]
+
+
+def subscribe_markup(items=None):
+    rows = [[{"text": sub_btn_text(s), "url": s["url"]}] for s in (items if items is not None else get_subs()) if s.get("url")]
+    rows.append([{"text": "✅ Я подписался", "callback_data": "subchk"}])
+    return {"inline_keyboard": rows}
+
+
+def member_ok(chat, user_id):
+    """True/False — состоит ли пользователь в чате; None — проверить не удалось (бот не админ и т.п.)."""
+    r = tg("getChatMember", chat_id=chat, user_id=user_id)
     if r is None:
         return None
     st = r.get("status")
     return st in ("creator", "administrator", "member") or (st == "restricted" and bool(r.get("is_member")))
 
 
+def subs_check(user_id):
+    """(состояние, не подписан на, не удалось проверить). Состояние: True — всё выполнено, False — есть неподписанные, None — проверка не удалась.
+    Боты и закрытые ссылки без ID проверить нельзя — они только показываются кнопкой."""
+    missing, failed = [], []
+    for s in get_subs():
+        if not s.get("check") or not s.get("chat"):
+            continue
+        ok = member_ok(s["chat"], user_id)
+        if ok is None:
+            failed.append(s)
+        elif not ok:
+            missing.append(s)
+    if missing:
+        return False, missing, failed
+    if failed:
+        return None, [], failed
+    return True, [], []
+
+
+def warn_cant_check(failed):
+    notify_admins("Бот не может проверить подписку: %s\n<code>%s</code>\nСделайте бота администратором канала (для группы достаточно добавить участником)." % (
+        esc(", ".join(f.get("title", "?") for f in failed)), esc(LAST_TG_ERR["text"])), key="chanperm", every=21600)
+
+
 def on_subcheck(cb):
     uid = cb["from"]["id"]
-    st = channel_subscribed(uid)
-    if st is None:
-        notify_admins("Бот не может проверить подписку на канал @%s: <code>%s</code>\nДобавьте бота администратором канала." % (esc(CHANNEL), esc(LAST_TG_ERR["text"])), key="chanperm", every=21600)
+    state, missing, failed = subs_check(uid)
+    if state is None:
+        warn_cant_check(failed)
         return tg("answerCallbackQuery", callback_query_id=cb["id"], text="Не удалось проверить подписку. Попробуйте чуть позже.", show_alert=True)
-    if not st:
-        return tg("answerCallbackQuery", callback_query_id=cb["id"], text="Вы ещё не подписаны. Нажмите «Подписаться», затем снова «Я подписался».", show_alert=True)
+    if state is False:
+        names = ", ".join(m.get("title", "?") for m in missing)
+        return tg("answerCallbackQuery", callback_query_id=cb["id"], text=("Вы ещё не подписаны: %s. Нажмите кнопку подписки, затем снова «Я подписался»." % names)[:190], show_alert=True)
     now = int(time.time() * 1000)
     try:
         for d in db.collection("users").where("telegramChatId", "==", uid).limit(3).stream():
             d.reference.update({"chSub": True, "chCheckedAt": now})
     except Exception:
         log.exception("subcheck users")
-    tg("editMessageText", chat_id=cb["message"]["chat"]["id"], message_id=cb["message"]["message_id"], text="✅ Спасибо! Вы подписаны на канал KORVON.SHOP.")
+    tg("editMessageText", chat_id=cb["message"]["chat"]["id"], message_id=cb["message"]["message_id"], text="✅ Спасибо! Вы подписаны.")
     tg("answerCallbackQuery", callback_query_id=cb["id"], text="Спасибо за подписку!")
 
 
+# ---------- управление списком подписок админом внутри бота ----------
+def subs_text():
+    items = get_subs()
+    if not items:
+        return "<b>Обязательные подписки</b>\n\nСписок пуст — клиентам ничего не предлагается. Нажмите «Добавить»."
+    out = ["<b>Обязательные подписки</b>", "Клиентам приходит предложение подписаться, пока они не подпишутся на всё из списка.", ""]
+    for i, s in enumerate(items, 1):
+        out.append("%d. %s %s — %s%s" % (i, SUB_ICON.get(s.get("kind"), "📢"), esc(s.get("title", "")), esc(s.get("url", "")),
+                                         "" if s.get("check") else "  <i>(без проверки)</i>"))
+    return "\n".join(out)
+
+
+def subs_markup():
+    rows = [[{"text": "➕ Добавить канал / группу / бота", "callback_data": "sa"}]]
+    for s in get_subs():
+        rows.append([{"text": "🗑 Удалить: " + (s.get("title") or "?")[:35], "callback_data": "sd:" + s["id"]}])
+    return {"inline_keyboard": rows}
+
+
+def subs_show(chat, msg_id=None):
+    if msg_id:
+        return tg("editMessageText", chat_id=chat, message_id=msg_id, text=subs_text(), parse_mode="HTML", disable_web_page_preview=True, reply_markup=subs_markup())
+    return say(chat, subs_text(), reply_markup=subs_markup())
+
+
+ADD_HELP = ("➕ <b>Новая подписка</b>\n\nПришлите одно из:\n"
+            "• <code>@username</code> или ссылку <code>t.me/username</code> — публичный канал, группа или бот;\n"
+            "• ссылку-приглашение <code>t.me/+…</code> — закрытый канал/группа;\n"
+            "• любой пост, <b>пересланный</b> из канала/группы — так бот возьмёт ID и сможет проверять подписку.\n\n"
+            "Чтобы бот проверял подписку, он должен быть <b>администратором</b> канала (в группе достаточно участника). "
+            "У ботов подписку проверить нельзя — клиенту просто покажется кнопка «Запустить».")
+CANCEL_KB = {"inline_keyboard": [[{"text": "✖ Отмена", "callback_data": "sx"}]]}
+
+
+def sub_finish(chat, item):
+    items = get_subs()
+    for s in items:
+        if s["id"] == item["id"] or (item.get("chat") and s.get("chat") == item["chat"]) or s.get("url") == item.get("url"):
+            SUB_SESS.pop(chat, None)
+            return say(chat, "Это уже есть в списке.", reply_markup=subs_markup())
+    if item["kind"] != "bot" and item.get("chat"):
+        item["check"] = member_ok(item["chat"], chat) is not None  # проверка возможна, если бот видит участников
+    else:
+        item["check"] = False
+    save_subs(items + [item])
+    SUB_SESS.pop(chat, None)
+    note = ""
+    if item["kind"] == "bot":
+        note = "\n\nПодписку на бота проверить нельзя — клиент увидит кнопку «Запустить»."
+    elif not item["check"]:
+        note = ("\n\n⚠️ Бот не видит участников этого чата, поэтому подписку проверять не будет (только кнопка). "
+                "Сделайте бота администратором, затем удалите и добавьте заново.")
+    say(chat, "✅ Добавлено: %s %s%s" % (SUB_ICON.get(item["kind"], "📢"), esc(item["title"]), note))
+    subs_show(chat)
+
+
+def sub_item_from_chat(info, url=None):
+    kind = "channel" if info.get("type") == "channel" else "group"
+    un = info.get("username")
+    return {"id": "s%d" % int(time.time() * 1000), "kind": kind, "chat": ("@" + un) if un else info["id"],
+            "title": info.get("title") or ("@" + un if un else "Чат"), "url": ("https://t.me/" + un) if un else url}
+
+
+def sub_add_input(chat, m, text):
+    sess = SUB_SESS.get(chat) or {}
+    pend = sess.get("pending") or {}
+    # пересланный пост из канала/группы → берём ID и название
+    fc = (m.get("forward_origin") or {}).get("chat") or m.get("forward_from_chat")
+    if fc and fc.get("id"):
+        info = tg("getChat", chat_id=fc["id"]) or fc
+        url = pend.get("url") or (("https://t.me/" + info["username"]) if info.get("username") else None) or tg("exportChatInviteLink", chat_id=fc["id"])
+        if not url:
+            return say(chat, "Не получил ссылку на этот чат. Пришлите ссылку-приглашение <code>t.me/+…</code> или сделайте бота администратором и перешлите пост снова.", reply_markup=CANCEL_KB)
+        return sub_finish(chat, sub_item_from_chat(info, url))
+    t = (text or "").strip()
+    if not t:
+        return say(chat, "Пришлите @username, ссылку или перешлите пост из канала.", reply_markup=CANCEL_KB)
+    if re.fullmatch(r"-100\d{5,}", t):
+        info = tg("getChat", chat_id=int(t))
+        if not info:
+            return say(chat, "Бот не видит этот чат: <code>%s</code>\nДобавьте бота в чат и повторите." % esc(LAST_TG_ERR["text"]), reply_markup=CANCEL_KB)
+        url = pend.get("url") or (("https://t.me/" + info["username"]) if info.get("username") else None) or tg("exportChatInviteLink", chat_id=int(t))
+        if not url:
+            return say(chat, "Не получил ссылку. Пришлите ссылку-приглашение <code>t.me/+…</code>.", reply_markup=CANCEL_KB)
+        return sub_finish(chat, sub_item_from_chat(info, url))
+    mi = re.match(r"^(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(\+[\w-]+|joinchat/[\w-]+)/?$", t, re.I)
+    if mi:
+        link = "https://t.me/" + mi.group(1)
+        SUB_SESS[chat] = {"step": "invite_id", "pending": {"url": link}}
+        return say(chat, "🔒 Закрытая ссылка принята.\nЧтобы бот мог проверять подписку, <b>перешлите сюда любой пост</b> из этого канала/группы (бот должен быть там админом) или пришлите ID чата <code>-100…</code>.\n"
+                         "Либо нажмите «Пропустить» — кнопка будет без проверки.",
+                   reply_markup={"inline_keyboard": [[{"text": "⏭ Пропустить", "callback_data": "sk"}], [{"text": "✖ Отмена", "callback_data": "sx"}]]})
+    mu = re.match(r"^(?:https?://)?(?:www\.)?(?:(?:t|telegram)\.me/)?@?([A-Za-z][\w]{3,31})/?$", t, re.I)
+    if not mu:
+        return say(chat, "Не понял. Пришлите @username, ссылку t.me/… или перешлите пост из канала.", reply_markup=CANCEL_KB)
+    name = mu.group(1)
+    info = tg("getChat", chat_id="@" + name)
+    if info and info.get("type") in ("channel", "supergroup", "group"):
+        return sub_finish(chat, sub_item_from_chat(info))
+    if name.lower().endswith("bot"):
+        return sub_finish(chat, {"id": "s%d" % int(time.time() * 1000), "kind": "bot", "chat": None, "title": "@" + name, "url": "https://t.me/" + name})
+    return say(chat, "Не нашёл «@%s». Проверьте имя. Если канал закрытый — пришлите ссылку-приглашение или перешлите оттуда пост." % esc(name), reply_markup=CANCEL_KB)
+
+
+def subs_callback(cb, act, arg):
+    chat = cb["message"]["chat"]["id"]
+    mid = cb["message"]["message_id"]
+    tg("answerCallbackQuery", callback_query_id=cb["id"])
+    if act == "sm":
+        SUB_SESS.pop(chat, None)
+        return subs_show(chat, mid)
+    if act == "sa":
+        SUB_SESS[chat] = {"step": "ref", "pending": {}}
+        return tg("editMessageText", chat_id=chat, message_id=mid, text=ADD_HELP, parse_mode="HTML", disable_web_page_preview=True, reply_markup=CANCEL_KB)
+    if act == "sx":
+        SUB_SESS.pop(chat, None)
+        return subs_show(chat, mid)
+    if act == "sk":  # закрытая ссылка без проверки
+        sess = SUB_SESS.pop(chat, None) or {}
+        url = (sess.get("pending") or {}).get("url")
+        if not url:
+            return subs_show(chat, mid)
+        return sub_finish(chat, {"id": "s%d" % int(time.time() * 1000), "kind": "channel", "chat": None, "title": "Закрытый канал/группа", "url": url})
+    if act == "sd":
+        s = next((x for x in get_subs() if x["id"] == arg), None)
+        if not s:
+            return subs_show(chat, mid)
+        return tg("editMessageText", chat_id=chat, message_id=mid, parse_mode="HTML",
+                  text="Удалить из обязательных подписок:\n%s <b>%s</b>?" % (SUB_ICON.get(s.get("kind"), "📢"), esc(s.get("title", ""))),
+                  reply_markup={"inline_keyboard": [[{"text": "🗑 Да, удалить", "callback_data": "sdy:" + arg}, {"text": "↩ Назад", "callback_data": "sm"}]]})
+    if act == "sdy":
+        save_subs([x for x in get_subs() if x["id"] != arg])
+        return subs_show(chat, mid)
+
+
 def channel_reminders():
-    """Каждые ~4 часа проверяем клиентов с включёнными уведомлениями; не подписанным шлём сообщение с кнопкой «Подписаться»."""
+    """Каждые ~4 часа проверяем клиентов с включёнными уведомлениями; не подписанным шлём сообщение с кнопками подписки."""
+    if not any(x.get("check") and x.get("chat") for x in get_subs()):
+        return  # проверять нечего (список пуст или одни боты/закрытые ссылки)
     now = int(time.time() * 1000)
     for d in db.collection("users").where("telegramNotifyEnabled", "==", True).stream():
         u = d.to_dict() or {}
@@ -1165,13 +1367,15 @@ def channel_reminders():
         gap = 24 * 3600000 if u.get("chSub") else 4 * 3600000 - 60000  # подписанных перепроверяем раз в сутки
         if now - int(u.get("chCheckedAt") or 0) < gap:
             continue
-        st = channel_subscribed(chat)
-        if st is None:
-            notify_admins("Бот не может проверить подписку на канал @%s: <code>%s</code>\nДобавьте бота администратором канала (хватит права «просмотр участников»)." % (esc(CHANNEL), esc(LAST_TG_ERR["text"])), key="chanperm", every=21600)
+        state, missing, failed = subs_check(chat)
+        if state is None:
+            warn_cant_check(failed)
             return
-        d.reference.update({"chSub": st, "chCheckedAt": now})
-        if not st:
-            say(chat, "📢 Вы ещё не подписаны на наш канал — там все новинки и акции первыми. Подпишитесь, чтобы ничего не пропустить!", reply_markup=subscribe_markup())
+        d.reference.update({"chSub": state, "chCheckedAt": now})
+        if state is False:
+            shown = missing + [x for x in get_subs() if not (x.get("check") and x.get("chat"))]
+            say(chat, "📢 Вы ещё не подписаны: %s — там все новинки и акции первыми. Подпишитесь, чтобы ничего не пропустить!" % esc(", ".join(m.get("title", "?") for m in missing)),
+                reply_markup=subscribe_markup(shown))
         time.sleep(0.05)
 
 
@@ -1494,13 +1698,18 @@ def status_text(chat):
 
 
 def on_command(chat, cmd, text=""):
+    if cmd in ("/subs", "/channels"):
+        if chat not in admin_ids():
+            return say(chat, "Только для администратора.")
+        SUB_SESS.pop(chat, None)
+        return subs_show(chat)
     if cmd == "/promo":
         parts = text.split()
         return promo_preview(chat, parts[1] if len(parts) > 1 else "")
     if cmd == "/status":
         return say(chat, status_text(chat))
     if cmd == "/help":
-        return say(chat, HELP_TEXT)
+        return say(chat, HELP_TEXT + ("\n/subs — обязательные подписки: каналы, группы, боты (для админа)" if chat in admin_ids() else ""))
     kref = db.collection("kycSessions").document(str(chat))
     if cmd == "/continue":
         ks = kref.get()
@@ -1531,6 +1740,11 @@ def handle(u):
         return
     chat = m["chat"]["id"]
     text = (m.get("text") or "").strip()
+    if chat in SUB_SESS:  # админ в режиме «добавить подписку»
+        if text.startswith("/"):
+            SUB_SESS.pop(chat, None)
+        else:
+            return sub_add_input(chat, m, text)
     if text.startswith("/start"):
         return on_start(chat, m.get("from") or {}, text[6:].strip())
     if text.startswith("/"):
